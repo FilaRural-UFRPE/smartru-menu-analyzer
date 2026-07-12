@@ -20,7 +20,7 @@ POSTGRES_DB       = os.environ.get("POSTGRES_DB", "")
 POSTGRES_USER     = os.environ.get("POSTGRES_USER", "")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
 app = FastAPI(
     title="SmartRU Menu Analyzer",
