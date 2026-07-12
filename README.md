@@ -1,0 +1,1 @@
+# smartru-menu-analyzer
