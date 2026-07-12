@@ -5,7 +5,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -106,27 +106,6 @@ Se a imagem não for um cardápio, retorna {{"erro": "Imagem não é um cardápi
     return json.loads(text)
 
 
-# ─── Busca imagem ─────────────────────────────────────
-def fetch_menu_image(menu_id: int, meal_type: str = "lunch") -> bytes | None:
-    """Tenta buscar a imagem com e sem autenticação."""
-    headers_options = [
-        {"Authorization": f"Bearer {ADMIN_API_KEY}"},
-        {},  # sem autenticação
-    ]
-    for headers in headers_options:
-        try:
-            r = requests.get(
-                f"{SMARTRU_API_URL}/menu/image/{menu_id}/{meal_type}",
-                headers=headers,
-                timeout=10,
-            )
-            if r.status_code == 200 and len(r.content) > 0:
-                return r.content
-        except Exception:
-            pass
-    return None
-
-
 # ─── Guarda no banco ──────────────────────────────────
 def save_dishes_to_db(menu_id: int, dishes: dict):
     with get_connection() as conn:
@@ -149,37 +128,63 @@ def health():
     return {"status": "ok", "service": "SmartRU Menu Analyzer"}
 
 
-class AnalyzeRequest(BaseModel):
+@app.post("/analyze/upload")
+async def analyze_upload(
+    menu_id: int,
+    meal_type: str = "lunch",
+    file: UploadFile = File(...)
+):
+    """
+    Recebe a imagem diretamente por upload e analisa com Claude Vision.
+    Usa este endpoint quando a imagem não é acessível publicamente.
+    """
+    image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Ficheiro vazio.")
+
+    try:
+        dishes = analyze_menu_image(image_bytes, meal_type)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Claude Vision.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
+
+    if "erro" in dishes:
+        raise HTTPException(status_code=400, detail=dishes["erro"])
+
+    db_saved = False
+    try:
+        save_dishes_to_db(menu_id, dishes)
+        db_saved = True
+    except Exception as e:
+        print(f"Aviso: não foi possível guardar no banco: {e}")
+
+    return {
+        "menu_id":   menu_id,
+        "meal_type": meal_type,
+        "dishes":    dishes,
+        "db_saved":  db_saved,
+        "message":   "Pratos extraídos com sucesso!" if db_saved else "Pratos extraídos. Aguarda a migration para guardar no banco.",
+    }
+
+
+class AnalyzeBase64Request(BaseModel):
     menu_id: int
     meal_type: str = "lunch"
-    image_url: Optional[str] = None  # URL alternativa da imagem
+    image_base64: str  # imagem em base64
 
 
-@app.post("/analyze")
-def analyze(req: AnalyzeRequest):
-    # 1. Busca a imagem
-    image_bytes = None
+@app.post("/analyze/base64")
+def analyze_base64(req: AnalyzeBase64Request):
+    """
+    Recebe a imagem em base64 e analisa com Claude Vision.
+    """
+    try:
+        image_bytes = base64.b64decode(req.image_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Base64 inválido.")
 
-    # Se foi passada URL alternativa, usa ela
-    if req.image_url:
-        try:
-            r = requests.get(req.image_url, timeout=10)
-            if r.status_code == 200:
-                image_bytes = r.content
-        except Exception:
-            pass
-
-    # Senão, busca pela API SmartRU
-    if not image_bytes:
-        image_bytes = fetch_menu_image(req.menu_id, req.meal_type)
-
-    if not image_bytes:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Imagem do cardápio não encontrada. Tenta passar image_url directamente."
-        )
-
-    # 2. Claude Vision analisa
     try:
         dishes = analyze_menu_image(image_bytes, req.meal_type)
     except json.JSONDecodeError:
@@ -190,7 +195,6 @@ def analyze(req: AnalyzeRequest):
     if "erro" in dishes:
         raise HTTPException(status_code=400, detail=dishes["erro"])
 
-    # 3. Tenta guardar no banco
     db_saved = False
     try:
         save_dishes_to_db(req.menu_id, dishes)
@@ -217,24 +221,6 @@ def get_dishes(menu_id: int):
                 if not row or not row["dishes"]:
                     raise HTTPException(status_code=404, detail="Pratos não extraídos ainda.")
                 return {"menu_id": menu_id, "dishes": row["dishes"], "uploaded_at": str(row["uploaded_at"])}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/menu/current/dishes")
-def get_current_dishes():
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, dishes, uploaded_at FROM menu WHERE dishes IS NOT NULL ORDER BY uploaded_at DESC LIMIT 1"
-                )
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Nenhum cardápio com pratos extraídos.")
-                return {"menu_id": row["id"], "dishes": row["dishes"], "uploaded_at": str(row["uploaded_at"])}
     except HTTPException:
         raise
     except Exception as e:
