@@ -1,17 +1,16 @@
 import os
 import base64
-import anthropic
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import json
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
 # ─── Config ───────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 SMARTRU_API_URL   = os.environ.get("SMARTRU_API_URL", "https://semdesperdicio.smartru.com.br/api")
 ADMIN_API_KEY     = os.environ.get("ADMIN_API_KEY", "")
 
@@ -21,12 +20,12 @@ POSTGRES_DB       = os.environ.get("POSTGRES_DB", "")
 POSTGRES_USER     = os.environ.get("POSTGRES_USER", "")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 app = FastAPI(
     title="SmartRU Menu Analyzer",
-    description="Extrai pratos do cardápio usando Claude Vision",
-    version="1.0.0",
+    description="Extrai pratos do cardápio usando Google Gemini Vision",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -48,8 +47,8 @@ def get_connection():
         cursor_factory=RealDictCursor,
     )
 
-# ─── Claude Vision ────────────────────────────────────
-def analyze_menu_image(image_bytes: bytes, meal_type: str = "almoco") -> dict:
+# ─── Gemini Vision ────────────────────────────────────
+def analyze_menu_image(image_bytes: bytes, meal_type: str = "lunch") -> dict:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
     prompt = f"""Analisa esta imagem do cardápio do Restaurante Universitário.
@@ -80,28 +79,28 @@ Se não conseguires ler alguma parte da imagem, coloca null nesse campo.
 Se a imagem não for um cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
 """
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        messages=[
+    payload = {
+        "contents": [
             {
-                "role": "user",
-                "content": [
+                "parts": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
                             "data": image_b64,
-                        },
+                        }
                     },
-                    {"type": "text", "text": prompt},
-                ],
+                    {"text": prompt},
+                ]
             }
-        ],
-    )
+        ]
+    }
 
-    text = response.content[0].text.strip()
+    r = requests.post(GEMINI_URL, json=payload, timeout=30)
+
+    if r.status_code != 200:
+        raise Exception(f"Gemini API erro {r.status_code}: {r.text[:200]}")
+
+    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     text = text.replace("```json", "").replace("```", "").strip()
     return json.loads(text)
 
@@ -120,12 +119,12 @@ def save_dishes_to_db(menu_id: int, dishes: dict):
 # ─── Endpoints ────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"service": "SmartRU Menu Analyzer", "status": "ok"}
+    return {"service": "SmartRU Menu Analyzer", "runtime": "Gemini Vision", "status": "ok"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "SmartRU Menu Analyzer"}
+    return {"status": "ok", "service": "SmartRU Menu Analyzer", "runtime": "Gemini Vision"}
 
 
 @app.post("/analyze/upload")
@@ -135,8 +134,7 @@ async def analyze_upload(
     file: UploadFile = File(...)
 ):
     """
-    Recebe a imagem diretamente por upload e analisa com Claude Vision.
-    Usa este endpoint quando a imagem não é acessível publicamente.
+    Recebe a imagem diretamente por upload e analisa com Gemini Vision.
     """
     image_bytes = await file.read()
 
@@ -146,7 +144,7 @@ async def analyze_upload(
     try:
         dishes = analyze_menu_image(image_bytes, meal_type)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Claude Vision.")
+        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Gemini Vision.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
 
@@ -172,14 +170,12 @@ async def analyze_upload(
 class AnalyzeBase64Request(BaseModel):
     menu_id: int
     meal_type: str = "lunch"
-    image_base64: str  # imagem em base64
+    image_base64: str
 
 
 @app.post("/analyze/base64")
 def analyze_base64(req: AnalyzeBase64Request):
-    """
-    Recebe a imagem em base64 e analisa com Claude Vision.
-    """
+    """Recebe a imagem em base64 e analisa com Gemini Vision."""
     try:
         image_bytes = base64.b64decode(req.image_base64)
     except Exception:
@@ -188,7 +184,7 @@ def analyze_base64(req: AnalyzeBase64Request):
     try:
         dishes = analyze_menu_image(image_bytes, req.meal_type)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Claude Vision.")
+        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Gemini Vision.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
 
