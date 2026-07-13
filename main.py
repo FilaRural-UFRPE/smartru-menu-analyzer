@@ -9,7 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ─── Config ───────────────────────────────────────────
-HF_API_KEY        = os.environ.get("HF_API_KEY", "")
+CF_API_TOKEN      = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CF_ACCOUNT_ID     = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 SMARTRU_API_URL   = os.environ.get("SMARTRU_API_URL", "https://semdesperdicio.smartru.com.br/api")
 ADMIN_API_KEY     = os.environ.get("ADMIN_API_KEY", "")
 
@@ -19,14 +20,14 @@ POSTGRES_DB       = os.environ.get("POSTGRES_DB", "")
 POSTGRES_USER     = os.environ.get("POSTGRES_USER", "")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 
-# Modelo de visão gratuito no Hugging Face
-HF_MODEL = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-HF_URL   = f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions"
+# Modelo de visão gratuito do Cloudflare
+CF_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct"
+CF_URL   = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
 
 app = FastAPI(
     title="SmartRU Menu Analyzer",
-    description="Extrai pratos do cardápio usando Hugging Face Vision",
-    version="3.0.0",
+    description="Extrai pratos do cardápio usando Cloudflare Workers AI",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -48,10 +49,9 @@ def get_connection():
         cursor_factory=RealDictCursor,
     )
 
-# ─── Hugging Face Vision ──────────────────────────────
+# ─── Cloudflare Workers AI Vision ─────────────────────
 def analyze_menu_image(image_bytes: bytes, meal_type: str = "lunch") -> dict:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    image_url = f"data:image/jpeg;base64,{image_b64}"
 
     prompt = f"""Analisa esta imagem do cardápio do Restaurante Universitário.
 
@@ -80,12 +80,14 @@ Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
 """
 
     payload = {
-        "model": HF_MODEL,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
                     {"type": "text", "text": prompt},
                 ],
             }
@@ -94,9 +96,9 @@ Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
     }
 
     r = requests.post(
-        HF_URL,
+        CF_URL,
         headers={
-            "Authorization": f"Bearer {HF_API_KEY}",
+            "Authorization": f"Bearer {CF_API_TOKEN}",
             "Content-Type": "application/json",
         },
         json=payload,
@@ -104,9 +106,13 @@ Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
     )
 
     if r.status_code != 200:
-        raise Exception(f"HuggingFace API erro {r.status_code}: {r.text[:300]}")
+        raise Exception(f"Cloudflare AI erro {r.status_code}: {r.text[:300]}")
 
-    text = r.json()["choices"][0]["message"]["content"].strip()
+    result = r.json()
+    text = result.get("result", {}).get("response", "")
+    if not text:
+        raise Exception(f"Resposta vazia do Cloudflare AI: {result}")
+
     text = text.replace("```json", "").replace("```", "").strip()
     return json.loads(text)
 
@@ -125,12 +131,12 @@ def save_dishes_to_db(menu_id: int, dishes: dict):
 # ─── Endpoints ────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"service": "SmartRU Menu Analyzer", "runtime": "HuggingFace Vision", "status": "ok"}
+    return {"service": "SmartRU Menu Analyzer", "runtime": "Cloudflare Workers AI", "status": "ok"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "SmartRU Menu Analyzer", "runtime": "HuggingFace Vision"}
+    return {"status": "ok", "service": "SmartRU Menu Analyzer", "runtime": "Cloudflare Workers AI"}
 
 
 @app.post("/analyze/upload")
@@ -139,7 +145,7 @@ async def analyze_upload(
     meal_type: str = "lunch",
     file: UploadFile = File(...)
 ):
-    """Recebe imagem por upload e analisa com HuggingFace Vision."""
+    """Recebe imagem por upload e analisa com Cloudflare Workers AI."""
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Ficheiro vazio.")
@@ -178,7 +184,7 @@ class AnalyzeBase64Request(BaseModel):
 
 @app.post("/analyze/base64")
 def analyze_base64(req: AnalyzeBase64Request):
-    """Recebe imagem em base64 e analisa com HuggingFace Vision."""
+    """Recebe imagem em base64 e analisa com Cloudflare Workers AI."""
     try:
         image_bytes = base64.b64decode(req.image_base64)
     except Exception:
