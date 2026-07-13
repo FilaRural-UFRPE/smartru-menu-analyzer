@@ -7,10 +7,9 @@ from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 
 # ─── Config ───────────────────────────────────────────
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+HF_API_KEY        = os.environ.get("HF_API_KEY", "")
 SMARTRU_API_URL   = os.environ.get("SMARTRU_API_URL", "https://semdesperdicio.smartru.com.br/api")
 ADMIN_API_KEY     = os.environ.get("ADMIN_API_KEY", "")
 
@@ -20,12 +19,14 @@ POSTGRES_DB       = os.environ.get("POSTGRES_DB", "")
 POSTGRES_USER     = os.environ.get("POSTGRES_USER", "")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+# Modelo de visão gratuito no Hugging Face
+HF_MODEL = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+HF_URL   = f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions"
 
 app = FastAPI(
     title="SmartRU Menu Analyzer",
-    description="Extrai pratos do cardápio usando Google Gemini Vision",
-    version="2.0.0",
+    description="Extrai pratos do cardápio usando Hugging Face Vision",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -47,22 +48,21 @@ def get_connection():
         cursor_factory=RealDictCursor,
     )
 
-# ─── Gemini Vision ────────────────────────────────────
+# ─── Hugging Face Vision ──────────────────────────────
 def analyze_menu_image(image_bytes: bytes, meal_type: str = "lunch") -> dict:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    image_url = f"data:image/jpeg;base64,{image_b64}"
 
     prompt = f"""Analisa esta imagem do cardápio do Restaurante Universitário.
 
-Extrai TODOS os pratos listados no cardápio e organiza em JSON.
-
-Retorna APENAS o JSON, sem texto adicional, neste formato:
+Extrai TODOS os pratos listados e retorna APENAS JSON neste formato:
 {{
   "meal_type": "{meal_type}",
   "dishes": {{
     "prato_principal": ["prato1", "prato2"],
     "guarnicao": ["item1", "item2"],
     "sobremesa": ["item1"],
-    "salada": ["item1", "item2"],
+    "salada": ["item1"],
     "suco": ["item1"],
     "outros": ["item1"]
   }},
@@ -72,35 +72,41 @@ Retorna APENAS o JSON, sem texto adicional, neste formato:
     "select": ["prato1"],
     "vegetariano": ["prato1"]
   }},
-  "observacoes": "qualquer informação adicional relevante"
+  "observacoes": "informações adicionais"
 }}
 
-Se não conseguires ler alguma parte da imagem, coloca null nesse campo.
-Se a imagem não for um cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
+Retorna APENAS o JSON, sem texto adicional.
+Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
 """
 
     payload = {
-        "contents": [
+        "model": HF_MODEL,
+        "messages": [
             {
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image_b64,
-                        }
-                    },
-                    {"text": prompt},
-                ]
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": prompt},
+                ],
             }
-        ]
+        ],
+        "max_tokens": 1000,
     }
 
-    r = requests.post(GEMINI_URL, json=payload, timeout=30)
+    r = requests.post(
+        HF_URL,
+        headers={
+            "Authorization": f"Bearer {HF_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
 
     if r.status_code != 200:
-        raise Exception(f"Gemini API erro {r.status_code}: {r.text[:200]}")
+        raise Exception(f"HuggingFace API erro {r.status_code}: {r.text[:300]}")
 
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    text = r.json()["choices"][0]["message"]["content"].strip()
     text = text.replace("```json", "").replace("```", "").strip()
     return json.loads(text)
 
@@ -119,12 +125,12 @@ def save_dishes_to_db(menu_id: int, dishes: dict):
 # ─── Endpoints ────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"service": "SmartRU Menu Analyzer", "runtime": "Gemini Vision", "status": "ok"}
+    return {"service": "SmartRU Menu Analyzer", "runtime": "HuggingFace Vision", "status": "ok"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "SmartRU Menu Analyzer", "runtime": "Gemini Vision"}
+    return {"status": "ok", "service": "SmartRU Menu Analyzer", "runtime": "HuggingFace Vision"}
 
 
 @app.post("/analyze/upload")
@@ -133,18 +139,15 @@ async def analyze_upload(
     meal_type: str = "lunch",
     file: UploadFile = File(...)
 ):
-    """
-    Recebe a imagem diretamente por upload e analisa com Gemini Vision.
-    """
+    """Recebe imagem por upload e analisa com HuggingFace Vision."""
     image_bytes = await file.read()
-
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Ficheiro vazio.")
 
     try:
         dishes = analyze_menu_image(image_bytes, meal_type)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Gemini Vision.")
+        raise HTTPException(status_code=500, detail="Erro ao processar resposta do modelo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
 
@@ -175,7 +178,7 @@ class AnalyzeBase64Request(BaseModel):
 
 @app.post("/analyze/base64")
 def analyze_base64(req: AnalyzeBase64Request):
-    """Recebe a imagem em base64 e analisa com Gemini Vision."""
+    """Recebe imagem em base64 e analisa com HuggingFace Vision."""
     try:
         image_bytes = base64.b64decode(req.image_base64)
     except Exception:
@@ -184,7 +187,7 @@ def analyze_base64(req: AnalyzeBase64Request):
     try:
         dishes = analyze_menu_image(image_bytes, req.meal_type)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Erro ao processar resposta do Gemini Vision.")
+        raise HTTPException(status_code=500, detail="Erro ao processar resposta do modelo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
 
