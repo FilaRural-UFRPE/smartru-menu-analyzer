@@ -109,11 +109,29 @@ Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
         raise Exception(f"Cloudflare AI erro {r.status_code}: {r.text[:300]}")
 
     result = r.json()
-    text = result.get("result", {}).get("response", "")
+    print(f"Cloudflare raw response: {json.dumps(result)[:500]}")
+    
+    # Tenta extrair texto de diferentes formatos de resposta
+    text = ""
+    if result.get("result"):
+        r_data = result["result"]
+        if isinstance(r_data, dict):
+            text = r_data.get("response", "") or r_data.get("content", "") or r_data.get("text", "")
+        elif isinstance(r_data, str):
+            text = r_data
+    
     if not text:
         raise Exception(f"Resposta vazia do Cloudflare AI: {result}")
 
+    print(f"Texto extraído: {text[:300]}")
     text = text.replace("```json", "").replace("```", "").strip()
+    
+    # Tenta extrair JSON mesmo que haja texto extra
+    import re
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if json_match:
+        text = json_match.group()
+    
     return json.loads(text)
 
 
