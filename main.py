@@ -110,29 +110,27 @@ Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
 
     result = r.json()
     print(f"Cloudflare raw response: {json.dumps(result)[:500]}")
-    
-    # Tenta extrair texto de diferentes formatos de resposta
-    text = ""
-    if result.get("result"):
-        r_data = result["result"]
-        if isinstance(r_data, dict):
-            text = r_data.get("response", "") or r_data.get("content", "") or r_data.get("text", "")
-        elif isinstance(r_data, str):
-            text = r_data
-    
-    if not text:
+
+    if not result.get("result"):
         raise Exception(f"Resposta vazia do Cloudflare AI: {result}")
 
-    print(f"Texto extraído: {text[:300]}")
-    text = text.replace("```json", "").replace("```", "").strip()
-    
-    # Tenta extrair JSON mesmo que haja texto extra
-    import re
-    json_match = re.search(r'\{.*\}', text, re.DOTALL)
-    if json_match:
-        text = json_match.group()
-    
-    return json.loads(text)
+    r_data = result["result"]
+    response = r_data.get("response", "")
+
+    # Se a resposta já é um dicionário (JSON parseado pelo Cloudflare), usa directamente
+    if isinstance(response, dict):
+        return response
+
+    # Se é string, tenta fazer parse
+    if isinstance(response, str):
+        text = response.replace("```json", "").replace("```", "").strip()
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            text = json_match.group()
+        return json.loads(text)
+
+    raise Exception(f"Formato de resposta inesperado: {type(response)}")
 
 
 # ─── Guarda no banco ──────────────────────────────────
