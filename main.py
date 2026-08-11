@@ -2,8 +2,6 @@ import os
 import base64
 import json
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,12 +12,6 @@ CF_ACCOUNT_ID     = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 SMARTRU_API_URL   = os.environ.get("SMARTRU_API_URL", "https://semdesperdicio.smartru.com.br/api")
 ADMIN_API_KEY     = os.environ.get("ADMIN_API_KEY", "")
 
-POSTGRES_HOST     = os.environ.get("POSTGRES_HOST", "")
-POSTGRES_PORT     = int(os.environ.get("POSTGRES_PORT", 5432))
-POSTGRES_DB       = os.environ.get("POSTGRES_DB", "")
-POSTGRES_USER     = os.environ.get("POSTGRES_USER", "")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
-
 # Modelo de visão gratuito do Cloudflare
 CF_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct"
 CF_URL   = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
@@ -27,7 +19,7 @@ CF_URL   = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/ru
 app = FastAPI(
     title="SmartRU Menu Analyzer",
     description="Extrai pratos do cardápio usando Cloudflare Workers AI",
-    version="4.0.0",
+    version="5.1.0",
 )
 
 app.add_middleware(
@@ -38,16 +30,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Banco de dados ───────────────────────────────────
-def get_connection():
-    return psycopg2.connect(
-        host=POSTGRES_HOST,
-        port=POSTGRES_PORT,
-        dbname=POSTGRES_DB,
-        user=POSTGRES_USER,
-        password=POSTGRES_PASSWORD,
-        cursor_factory=RealDictCursor,
+
+# ─── Adaptação de formato ──────────────────────────────
+def to_dishes_list(analysis: dict, meal_type: str) -> list[dict]:
+    """
+    O backend principal espera `dishes` como list[dict[str, Any]]
+    (ver MenuDishesRequest), mas o Cloudflare Workers AI devolve uma
+    estrutura aninhada por categoria. Esta função achata isso numa
+    lista de pratos, cada um com sua categoria e, se houver, os
+    tipos de refeição (essencial, leve_sabor, select, vegetariano)
+    aos quais pertence.
+    """
+    dishes_by_categoria = analysis.get("dishes", {}) or {}
+    tipos_por_prato = {}
+    for tipo, pratos in (analysis.get("tipos_refeicao", {}) or {}).items():
+        for prato in pratos:
+            tipos_por_prato.setdefault(prato, []).append(tipo)
+
+    items = []
+    for categoria, pratos in dishes_by_categoria.items():
+        for prato in pratos:
+            items.append({
+                "nome": prato,
+                "categoria": categoria,
+                "meal_type": meal_type,
+                "tipos_refeicao": tipos_por_prato.get(prato, []),
+                "observacoes": analysis.get("observacoes", ""),
+            })
+    return items
+
+
+# ─── Cliente do backend principal (RU Sem Desperdício) ─
+def save_dishes_via_api(menu_id: int, analysis: dict, meal_type: str) -> bool:
+    """Salva os pratos extraídos chamando o backend principal via API,
+    em vez de conectar direto no Postgres."""
+    try:
+        dishes_list = to_dishes_list(analysis, meal_type)
+        r = requests.post(
+            f"{SMARTRU_API_URL}/menu/{menu_id}/dishes",
+            headers={"Authorization": f"Bearer {ADMIN_API_KEY}"},
+            json={"dishes": dishes_list},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Aviso: não foi possível salvar via API: {e}")
+        return False
+
+
+def get_dishes_via_api(menu_id: int) -> dict:
+    """Busca os pratos já salvos chamando o backend principal via API."""
+    r = requests.get(
+        f"{SMARTRU_API_URL}/menu/{menu_id}/dishes",
+        headers={"Authorization": f"Bearer {ADMIN_API_KEY}"},
+        timeout=15,
     )
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="Pratos não extraídos ainda.")
+    r.raise_for_status()
+    return r.json()
+
 
 # ─── Cloudflare Workers AI Vision ─────────────────────
 def analyze_menu_image(image_bytes: bytes, meal_type: str = "lunch") -> dict:
@@ -133,17 +176,6 @@ Se não for cardápio, retorna {{"erro": "Imagem não é um cardápio"}}.
     raise Exception(f"Formato de resposta inesperado: {type(response)}")
 
 
-# ─── Guarda no banco ──────────────────────────────────
-def save_dishes_to_db(menu_id: int, dishes: dict):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE menu SET dishes = %s WHERE id = %s",
-                (json.dumps(dishes), menu_id)
-            )
-        conn.commit()
-
-
 # ─── Endpoints ────────────────────────────────────────
 @app.get("/")
 def root():
@@ -167,28 +199,23 @@ async def analyze_upload(
         raise HTTPException(status_code=400, detail="Ficheiro vazio.")
 
     try:
-        dishes = analyze_menu_image(image_bytes, meal_type)
+        analysis = analyze_menu_image(image_bytes, meal_type)
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Erro ao processar resposta do modelo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
 
-    if "erro" in dishes:
-        raise HTTPException(status_code=400, detail=dishes["erro"])
+    if "erro" in analysis:
+        raise HTTPException(status_code=400, detail=analysis["erro"])
 
-    db_saved = False
-    try:
-        save_dishes_to_db(menu_id, dishes)
-        db_saved = True
-    except Exception as e:
-        print(f"Aviso: não foi possível guardar no banco: {e}")
+    db_saved = save_dishes_via_api(menu_id, analysis, meal_type)
 
     return {
         "menu_id":   menu_id,
         "meal_type": meal_type,
-        "dishes":    dishes,
+        "dishes":    analysis.get("dishes", {}),
         "db_saved":  db_saved,
-        "message":   "Pratos extraídos com sucesso!" if db_saved else "Pratos extraídos. Aguarda a migration para guardar no banco.",
+        "message":   "Pratos extraídos com sucesso!" if db_saved else "Pratos extraídos, mas houve falha ao salvar via API.",
     }
 
 
@@ -207,42 +234,27 @@ def analyze_base64(req: AnalyzeBase64Request):
         raise HTTPException(status_code=400, detail="Base64 inválido.")
 
     try:
-        dishes = analyze_menu_image(image_bytes, req.meal_type)
+        analysis = analyze_menu_image(image_bytes, req.meal_type)
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Erro ao processar resposta do modelo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao analisar imagem: {str(e)}")
 
-    if "erro" in dishes:
-        raise HTTPException(status_code=400, detail=dishes["erro"])
+    if "erro" in analysis:
+        raise HTTPException(status_code=400, detail=analysis["erro"])
 
-    db_saved = False
-    try:
-        save_dishes_to_db(req.menu_id, dishes)
-        db_saved = True
-    except Exception as e:
-        print(f"Aviso: não foi possível guardar no banco: {e}")
+    db_saved = save_dishes_via_api(req.menu_id, analysis, req.meal_type)
 
     return {
         "menu_id":   req.menu_id,
         "meal_type": req.meal_type,
-        "dishes":    dishes,
+        "dishes":    analysis.get("dishes", {}),
         "db_saved":  db_saved,
-        "message":   "Pratos extraídos com sucesso!" if db_saved else "Pratos extraídos. Aguarda a migration para guardar no banco.",
+        "message":   "Pratos extraídos com sucesso!" if db_saved else "Pratos extraídos, mas houve falha ao salvar via API.",
     }
 
 
 @app.get("/menu/{menu_id}/dishes")
 def get_dishes(menu_id: int):
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT dishes, uploaded_at FROM menu WHERE id = %s", (menu_id,))
-                row = cur.fetchone()
-                if not row or not row["dishes"]:
-                    raise HTTPException(status_code=404, detail="Pratos não extraídos ainda.")
-                return {"menu_id": menu_id, "dishes": row["dishes"], "uploaded_at": str(row["uploaded_at"])}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Repassa a consulta pro backend principal em vez de ler direto do Postgres."""
+    return get_dishes_via_api(menu_id)
